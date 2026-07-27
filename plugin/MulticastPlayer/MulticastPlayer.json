@@ -1,0 +1,89 @@
+{
+  "$schema": "https://raw.githubusercontent.com/rdkcentral/Thunder/master/Tools/JsonGenerator/schemas/interface.schema.json",
+  "jsonrpc": "2.0",
+  "info": {
+    "title": "MulticastPlayer API",
+    "class": "MulticastPlayer",
+    "description": "JSON-RPC control surface for native IP-multicast playback (unencrypted CBR MPEG-TS over UDP/RTP) on an RDKV device. The downloadable Lightning widget is the only intended caller."
+  },
+  "common": {
+    "$ref": "https://raw.githubusercontent.com/rdkcentral/Thunder/master/Tools/JsonGenerator/schemas/common.json"
+  },
+  "methods": {
+    "open": {
+      "summary": "Build the multicast pipeline for a locator. Does not join the group yet.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "uri": { "type": "string", "example": "udp://239.1.1.1:5000", "description": "Multicast locator (udp:// or rtp://)." },
+          "transport": { "type": "string", "enum": ["auto", "udp", "rtp"], "default": "auto" },
+          "interface": { "type": "string", "example": "eth0", "description": "Optional multicast NIC." }
+        },
+        "required": ["uri"]
+      },
+      "result": {
+        "type": "object",
+        "properties": { "success": { "type": "boolean" } },
+        "required": ["success"]
+      }
+    },
+    "play": {
+      "summary": "Set the pipeline to PLAYING and join the IGMP group.",
+      "result": { "type": "object", "properties": { "success": { "type": "boolean" } }, "required": ["success"] }
+    },
+    "stop": {
+      "summary": "Stop playback and leave the IGMP group.",
+      "result": { "type": "object", "properties": { "success": { "type": "boolean" } }, "required": ["success"] }
+    },
+    "close": {
+      "summary": "Tear down the pipeline and release all resources.",
+      "result": { "type": "object", "properties": { "success": { "type": "boolean" } }, "required": ["success"] }
+    },
+    "setVideoRectangle": {
+      "summary": "Set the westerossink on-screen video rectangle.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "x": { "type": "integer", "default": 0 },
+          "y": { "type": "integer", "default": 0 },
+          "w": { "type": "integer" },
+          "h": { "type": "integer" }
+        },
+        "required": ["w", "h"]
+      },
+      "result": { "type": "object", "properties": { "success": { "type": "boolean" } }, "required": ["success"] }
+    },
+    "status": {
+      "summary": "Return the current pipeline state.",
+      "result": {
+        "type": "object",
+        "properties": {
+          "state": { "type": "string", "enum": ["IDLE", "OPENED", "PLAYING", "STOPPED", "ERROR"] },
+          "success": { "type": "boolean" }
+        },
+        "required": ["state", "success"]
+      }
+    }
+  },
+  "events": {
+    "onStatusChanged": {
+      "summary": "Emitted whenever the pipeline state changes.",
+      "params": {
+        "type": "object",
+        "properties": { "state": { "type": "string", "enum": ["IDLE", "OPENED", "PLAYING", "STOPPED", "ERROR"] } },
+        "required": ["state"]
+      }
+    },
+    "onError": {
+      "summary": "Emitted on a pipeline or stream error.",
+      "params": {
+        "type": "object",
+        "properties": { "code": { "type": "integer" }, "message": { "type": "string" } },
+        "required": ["code", "message"]
+      }
+    },
+    "onEnd": {
+      "summary": "Emitted on end-of-stream."
+    }
+  }
+}

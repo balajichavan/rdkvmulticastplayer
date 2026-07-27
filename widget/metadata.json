@@ -1,0 +1,22 @@
+{
+  "id": "com.rdkv.multicastwidget",
+  "name": "Multicast Live",
+  "version": "1.0.0",
+  "icon": "./static/icon.png",
+  "description": "Play IP-multicast live channels. UI-only widget; playback runs on the native MulticastPlayer plugin.",
+  "type": "application",
+  "category": "TV",
+  "capabilities": {
+    "used": [
+      "xrn:firebolt:capability:rpc:multicastplayer",
+      "xrn:firebolt:capability:network:multicast",
+      "xrn:firebolt:capability:media:decode",
+      "xrn:firebolt:capability:rendering:surface"
+    ]
+  },
+  "requirements": {
+    "thunder": {
+      "plugins": ["org.rdk.MulticastPlayer", "org.rdk.RDKShell"]
+    }
+  }
+}

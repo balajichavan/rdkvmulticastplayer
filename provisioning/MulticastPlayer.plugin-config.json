@@ -1,0 +1,14 @@
+{
+  "locations": [
+    {
+      "callsign": "org.rdk.MulticastPlayer",
+      "locator": "libWPEFrameworkMulticastPlayer.so",
+      "classname": "MulticastPlayer",
+      "autostart": false,
+      "configuration": {
+        "interface": "eth0",
+        "defaulttransport": "udp"
+      }
+    }
+  ]
+}

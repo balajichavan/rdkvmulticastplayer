@@ -1,0 +1,20 @@
+{
+  "name": "rdkv-multicast-widget",
+  "version": "1.0.0",
+  "description": "Downloadable RDKV carousel widget that plays an IP-multicast stream via the native org.rdk.MulticastPlayer Thunder plugin.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "lng build",
+    "start": "lng serve",
+    "dev": "lng dev",
+    "lint": "lng lint",
+    "release": "lng release"
+  },
+  "dependencies": {
+    "@lightningjs/sdk": "^5.4.0",
+    "ThunderJS": "^1.4.0"
+  },
+  "devDependencies": {
+    "@lightningjs/cli": "^2.12.0"
+  }
+}

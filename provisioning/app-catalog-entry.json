@@ -1,0 +1,27 @@
+{
+  "id": "com.rdkv.multicastwidget",
+  "title": "Multicast Live",
+  "type": "application",
+  "version": "1.0.0",
+  "visibility": "carousel",
+  "install": {
+    "type": "web",
+    "url": "https://apps.example-mso.com/multicast-widget/1.0.0/",
+    "entrypoint": "index.html"
+  },
+  "runtime": {
+    "engine": "lightning",
+    "transparent": true
+  },
+  "dependencies": {
+    "thunderPlugins": [
+      { "callsign": "org.rdk.MulticastPlayer", "minVersion": "1.0" },
+      { "callsign": "org.rdk.RDKShell", "minVersion": "1.0" }
+    ]
+  },
+  "capabilities": [
+    "xrn:firebolt:capability:network:multicast",
+    "xrn:firebolt:capability:media:decode",
+    "xrn:firebolt:capability:rendering:surface"
+  ]
+}

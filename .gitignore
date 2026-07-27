@@ -1,0 +1,43 @@
+# ---- Native plugin (C++/CMake) ----
+plugin/**/build/
+plugin/**/*.o
+plugin/**/*.so
+plugin/**/*.a
+plugin/**/CMakeCache.txt
+plugin/**/CMakeFiles/
+plugin/**/cmake_install.cmake
+plugin/**/Makefile
+
+# ---- Widget (Lightning.js / Node) ----
+widget/node_modules/
+widget/dist/
+widget/.lightningjs/
+npm-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# ---- Provisioning / packaging output ----
+provisioning/out/
+provisioning/keys/
+*.tgz
+*.sig
+
+# ---- Python (PPT generator) ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- Build / generated artifacts ----
+*.pptx
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
