@@ -19,9 +19,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Configuration
-PLUGIN_DIR="plugin/MulticastPlayer"
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_SO="${PLUGIN_DIR}/build/libWPEFrameworkMulticastPlayer.so"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE:-$0}")" && pwd)/.."
 
 # Print colored messages
 print_info() {
@@ -51,8 +49,7 @@ Options:
   test     Run the JSON-RPC tests only
   help     Show this help message
 
-This script assumes you are already inside the RDK-V emulator/Thunder
-container and have sudo access.
+This script expects to be run from or placed inside the project root directory.
 EOF
 }
 
@@ -60,7 +57,7 @@ EOF
 check_prerequisites() {
     print_info "Checking prerequisites..."
     
-    # Check if we're in the right directory
+    # Check if we're in the right directory - always check from project root
     if [[ ! -f "${PROJECT_ROOT}/README.md" ]]; then
         print_error "README.md not found. Please run this from the project root."
         exit 1
@@ -106,6 +103,7 @@ check_prerequisites() {
 build_plugin() {
     print_info "Building RDKV MulticastPlayer plugin..."
     
+    PLUGIN_DIR="${PROJECT_ROOT}/plugin/MulticastPlayer"
     cd "${PROJECT_ROOT}/${PLUGIN_DIR}"
     
     # Create build directory
