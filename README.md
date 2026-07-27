@@ -275,7 +275,79 @@ ssh root@<pi-ip> 'ip maddr show dev eth0 | grep 239.1.1.1'   # present while pla
 
 ---
 
-## 7. Troubleshooting
+## 7. Testing
+
+Two helper scripts under [test/](test) let you validate the whole path without a
+real head-end.
+
+### 7.1 Start a sample multicast server (publicly available media)
+
+[test/multicast-server.sh](test/multicast-server.sh) loops a freely
+redistributable sample and pushes CBR MPEG-TS to a multicast group. Run it on a
+host on the **same L2 network / VLAN** as the Pi (multicast is not routed by
+default).
+
+```bash
+# Default: Big Buck Bunny (Google CDN) -> udp://239.1.1.1:5000
+test/multicast-server.sh
+
+# Pick a group/port or RTP transport
+GROUP=239.1.1.2 PORT=5000 test/multicast-server.sh
+TRANSPORT=rtp test/multicast-server.sh
+
+# Use Apple's public BipBop MPEG-TS sample instead
+SOURCE="https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_16x9/gear1/fileSequence0.ts" \
+  test/multicast-server.sh
+
+# Or your own local file (.ts or .mp4)
+SOURCE=./mystream.ts test/multicast-server.sh
+```
+
+Public sample sources used:
+
+| Name | URL | Format |
+|------|-----|--------|
+| Big Buck Bunny (default) | `https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4` | MP4 → remuxed to TS |
+| Apple BipBop segment | `https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_16x9/gear1/fileSequence0.ts` | MPEG-TS |
+
+> Requires `ffmpeg` (preferred) or `gstreamer1.0-tools` on the streaming host:
+> `sudo apt install ffmpeg`.
+
+### 7.2 Confirm the feed locally (optional)
+
+Before involving the device, verify the multicast feed plays on the streaming
+LAN with any standard player:
+
+```bash
+ffplay -fflags nobuffer "udp://239.1.1.1:5000"
+# or
+vlc udp://@239.1.1.1:5000
+```
+
+### 7.3 Drive the plugin over JSON-RPC
+
+[test/jsonrpc-test.sh](test/jsonrpc-test.sh) runs the full
+`open → play → status → stop → close` sequence against a running Thunder and
+checks the IGMP join.
+
+```bash
+HOST=<pi-ip> test/jsonrpc-test.sh
+HOST=<pi-ip> URI=udp://239.1.1.2:5000 TRANSPORT=udp test/jsonrpc-test.sh
+```
+
+### 7.4 End-to-end widget test
+
+1. Start the server (§7.1) on a LAN host.
+2. Ensure the channel line-up in
+   [widget/src/lib/channels.js](widget/src/lib/channels.js) matches the group/port
+   you streamed to.
+3. Launch the **Multicast Live** tile on the Pi carousel and select the channel.
+4. Expect: video in the window, status `PLAYING`, and the group visible in
+   `ip maddr show`. Pressing Back stops playback and leaves the group.
+
+---
+
+## 8. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
@@ -287,7 +359,7 @@ ssh root@<pi-ip> 'ip maddr show dev eth0 | grep 239.1.1.1'   # present while pla
 
 ---
 
-## 8. Package for production (downloadable)
+## 9. Package for production (downloadable)
 
 ```bash
 provisioning/sign-and-package.sh \
@@ -303,7 +375,7 @@ Then:
 
 ---
 
-## 9. Scope / assumptions
+## 10. Scope / assumptions
 - Unencrypted **CBR** multicast (no ABR, no DRM) — consistent with playback
   option 2. For ABR/DRM use AAMP (option 1).
 - The widget requests a surface via RDKShell; the plugin owns the decoder.
