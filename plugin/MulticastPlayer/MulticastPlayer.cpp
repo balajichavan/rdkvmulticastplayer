@@ -39,6 +39,16 @@ const string MulticastPlayer::Initialize(PluginHost::IShell* service) {
     _service = service;
     _service->AddRef();
 
+    // Read configuration: element overrides + default interface/transport.
+    Config config;
+    config.FromString(_service->ConfigLine());
+    _defaultInterface = config.Interface.Value();
+    _defaultTransport = config.DefaultTransport.Value();
+    _pipeline->SetElementProfile(
+        config.VideoDecoder.Value(),
+        config.AudioDecoder.Value(),
+        config.VideoSink.Value());
+
     _pipeline->SetStatusCallback([this](GstMulticastPipeline::State state) { OnStatus(state); });
     _pipeline->SetErrorCallback([this](int code, const std::string& message) { OnError(code, message); });
     _pipeline->SetEosCallback([this]() { OnEnd(); });
@@ -90,16 +100,21 @@ uint32_t MulticastPlayer::endpoint_open(const JsonObject& parameters, JsonObject
     }
 
     const string uri = parameters["uri"].String();
-    const string iface = parameters.HasLabel("interface") ? parameters["interface"].String() : string();
+    const string iface = parameters.HasLabel("interface")
+        ? parameters["interface"].String()
+        : _defaultInterface;
 
     GstMulticastPipeline::Transport transport = GstMulticastPipeline::Transport::Auto;
+    string t;
     if (parameters.HasLabel("transport")) {
-        const string t = parameters["transport"].String();
-        if (t == "udp") {
-            transport = GstMulticastPipeline::Transport::Udp;
-        } else if (t == "rtp") {
-            transport = GstMulticastPipeline::Transport::Rtp;
-        }
+        t = parameters["transport"].String();
+    } else {
+        t = _defaultTransport;
+    }
+    if (t == "udp") {
+        transport = GstMulticastPipeline::Transport::Udp;
+    } else if (t == "rtp") {
+        transport = GstMulticastPipeline::Transport::Rtp;
     }
 
     const bool ok = _pipeline->Open(uri.c_str(), transport, iface.c_str());

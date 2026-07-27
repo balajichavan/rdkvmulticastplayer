@@ -53,6 +53,49 @@ GstMulticastPipeline::~GstMulticastPipeline() {
     Close();
 }
 
+void GstMulticastPipeline::SetElementProfile(const std::string& videoDecoder,
+    const std::string& audioDecoder, const std::string& videoSink) {
+    std::lock_guard<std::mutex> guard(_lock);
+    _videoDecoderOverride = videoDecoder;
+    _audioDecoderOverride = audioDecoder;
+    _videoSinkOverride = videoSink;
+}
+
+GstElement* GstMulticastPipeline::MakeFirstAvailable(const std::string& override,
+    const std::vector<std::string>& candidates, const char* elementName,
+    std::string& chosen) {
+    // If an override is configured, try only that; otherwise walk the platform
+    // preference list (Broadcom STB -> Raspberry Pi V4L2 -> generic/software)
+    // and pick the first factory that is actually registered on this device.
+    std::vector<std::string> order;
+    if (override.empty() == false) {
+        order.push_back(override);
+    } else {
+        order = candidates;
+    }
+    for (const std::string& name : order) {
+        GstElement* element = gst_element_factory_make(name.c_str(), elementName);
+        if (element != nullptr) {
+            chosen = name;
+            return element;
+        }
+    }
+    chosen.clear();
+    return nullptr;
+}
+
+bool GstMulticastPipeline::ApplyRectangleToSink() {
+    // Called with _lock held. autovideosink/glimagesink have no geometry
+    // property, in which case _rectProperty is null and this is a no-op.
+    if (_videoSink == nullptr || _rectProperty == nullptr) {
+        return true;
+    }
+    gchar rect[64];
+    std::snprintf(rect, sizeof(rect), "%d,%d,%d,%d", _rectX, _rectY, _rectW, _rectH);
+    g_object_set(G_OBJECT(_videoSink), _rectProperty, rect, nullptr);
+    return true;
+}
+
 bool GstMulticastPipeline::ParseUri(const std::string& uri, std::string& host, int& port) const {
     // Accept "udp://host:port" or "rtp://host:port" or bare "host:port".
     std::string work = uri;
@@ -99,16 +142,22 @@ bool GstMulticastPipeline::Open(const std::string& uri, Transport transport, con
 
     GstElement* vqueue = gst_element_factory_make("queue", "vqueue");
     GstElement* vparse = gst_element_factory_make("h264parse", "vparse");
-    GstElement* vdec = gst_element_factory_make("brcmvideodecoder", "vdec");
-    _videoSink = gst_element_factory_make("westerossink", "vsink");
+    GstElement* vdec = MakeFirstAvailable(_videoDecoderOverride,
+        { "brcmvideodecoder", "v4l2h264dec", "omxh264dec", "avdec_h264" },
+        "vdec", _chosenVideoDecoder);
+    _videoSink = MakeFirstAvailable(_videoSinkOverride,
+        { "westerossink", "autovideosink", "glimagesink" },
+        "vsink", _chosenVideoSink);
 
     GstElement* aqueue = gst_element_factory_make("queue", "aqueue");
     GstElement* aparse = gst_element_factory_make("aacparse", "aparse");
-    GstElement* adec = gst_element_factory_make("brcmaudiodecoder", "adec");
-    GstElement* asink = gst_element_factory_make("amlhalasink", "asink");
-    if (asink == nullptr) {
-        asink = gst_element_factory_make("autoaudiosink", "asink");
-    }
+    GstElement* adec = MakeFirstAvailable(_audioDecoderOverride,
+        { "brcmaudiodecoder", "avdec_aac" },
+        "adec", _chosenAudioDecoder);
+    std::string chosenAudioSink;
+    GstElement* asink = MakeFirstAvailable("",
+        { "amlhalasink", "autoaudiosink" },
+        "asink", chosenAudioSink);
 
     if (_pipeline == nullptr || _source == nullptr || demux == nullptr ||
         vqueue == nullptr || vdec == nullptr || _videoSink == nullptr) {
@@ -147,11 +196,20 @@ bool GstMulticastPipeline::Open(const std::string& uri, Transport transport, con
         gst_caps_unref(caps);
     }
 
-    // Apply any previously requested rectangle to westerossink.
+    // Detect which geometry property (if any) the chosen sink exposes.
+    _rectProperty = nullptr;
+    if (_videoSink != nullptr) {
+        GObjectClass* klass = G_OBJECT_GET_CLASS(_videoSink);
+        if (g_object_class_find_property(klass, "rectangle") != nullptr) {
+            _rectProperty = "rectangle";
+        } else if (g_object_class_find_property(klass, "window-set") != nullptr) {
+            _rectProperty = "window-set";
+        }
+    }
+
+    // Apply any previously requested rectangle to the sink.
     if (_rectW > 0 && _rectH > 0) {
-        gchar rect[64];
-        std::snprintf(rect, sizeof(rect), "%d,%d,%d,%d", _rectX, _rectY, _rectW, _rectH);
-        g_object_set(G_OBJECT(_videoSink), "window-set", rect, nullptr);
+        ApplyRectangleToSink();
     }
 
     // Assemble the bin.
@@ -257,14 +315,9 @@ bool GstMulticastPipeline::SetVideoRectangle(int x, int y, int width, int height
     _rectY = y;
     _rectW = width;
     _rectH = height;
-    if (_videoSink == nullptr) {
-        // Stored; applied when the pipeline is built.
-        return true;
-    }
-    gchar rect[64];
-    std::snprintf(rect, sizeof(rect), "%d,%d,%d,%d", x, y, width, height);
-    g_object_set(G_OBJECT(_videoSink), "window-set", rect, nullptr);
-    return true;
+    // Stored now; applied when the pipeline/sink is built, or immediately if the
+    // sink already exists and exposes a geometry property.
+    return ApplyRectangleToSink();
 }
 
 GstMulticastPipeline::State GstMulticastPipeline::GetState() const {
@@ -320,6 +373,7 @@ void GstMulticastPipeline::Cleanup() {
     }
     _source = nullptr;
     _videoSink = nullptr;
+    _rectProperty = nullptr;
 }
 
 } // namespace Plugin

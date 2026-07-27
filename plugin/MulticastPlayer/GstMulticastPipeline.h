@@ -3,7 +3,9 @@
  *
  * Thin C++ wrapper around a GStreamer pipeline that plays an unencrypted,
  * constant-bitrate MPEG-TS IP-multicast stream (UDP-TS or RTP-TS) through the
- * platform hardware decode path (brcmvideodecoder -> westerossink).
+ * platform decode path. The video decoder, audio decoder and video sink are
+ * auto-detected at runtime (Broadcom STB -> Raspberry Pi V4L2 -> generic/
+ * software for the RDK-V emulator) and can be overridden from the plugin config.
  *
  * The pipeline is intentionally CBR / non-ABR (playback option 2). It performs
  * the IGMP join on PLAY and the IGMP leave on STOP via the udpsrc socket.
@@ -13,6 +15,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <gst/gst.h>
 
@@ -50,6 +53,13 @@ public:
     void SetErrorCallback(ErrorCallback cb) { _onError = std::move(cb); }
     void SetEosCallback(EosCallback cb) { _onEos = std::move(cb); }
 
+    // Optional element overrides. Empty strings keep automatic platform
+    // detection (Broadcom STB -> Raspberry Pi V4L2 -> generic/software). Any
+    // non-empty value forces that specific GStreamer factory.
+    void SetElementProfile(const std::string& videoDecoder,
+                           const std::string& audioDecoder,
+                           const std::string& videoSink);
+
     // Build the pipeline for the given multicast locator.
     // uri examples: "udp://239.1.1.1:5000", "rtp://239.1.1.1:5000".
     // Optional multicast interface (e.g. "eth0"); empty means system default.
@@ -75,10 +85,22 @@ private:
     void SetState(State state);
     void Cleanup();
 
+    // Create the first candidate factory that exists on this platform. If
+    // 'override' is non-empty it is tried first/exclusively. 'chosen' receives
+    // the factory name that was actually instantiated.
+    GstElement* MakeFirstAvailable(const std::string& override,
+                                   const std::vector<std::string>& candidates,
+                                   const char* elementName,
+                                   std::string& chosen);
+
+    // Apply the stored rectangle to whichever geometry property the selected
+    // sink exposes ("rectangle" or "window-set"). No-op if the sink has none.
+    bool ApplyRectangleToSink();
+
     mutable std::mutex _lock;
     GstElement* _pipeline{ nullptr };
     GstElement* _source{ nullptr };       // udpsrc
-    GstElement* _videoSink{ nullptr };     // westerossink
+    GstElement* _videoSink{ nullptr };     // westerossink / autovideosink / ...
     guint _busWatchId{ 0 };
     GMainContext* _busContext{ nullptr };
 
@@ -91,6 +113,15 @@ private:
     int _rectY{ 0 };
     int _rectW{ 0 };
     int _rectH{ 0 };
+
+    // Element overrides (empty => auto-detect) and the names finally chosen.
+    std::string _videoDecoderOverride;
+    std::string _audioDecoderOverride;
+    std::string _videoSinkOverride;
+    std::string _chosenVideoDecoder;
+    std::string _chosenAudioDecoder;
+    std::string _chosenVideoSink;
+    const char* _rectProperty{ nullptr };  // geometry property on the chosen sink
 
     StatusCallback _onStatus;
     ErrorCallback _onError;

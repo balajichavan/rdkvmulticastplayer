@@ -21,6 +21,33 @@ namespace Plugin {
 
 class MulticastPlayer : public PluginHost::IPlugin, public PluginHost::JSONRPC {
 public:
+    // Plugin configuration (from the Thunder plugin config JSON). Empty element
+    // names keep automatic platform detection; set them to force a factory
+    // (e.g. the emulator profile uses avdec_h264 / autovideosink).
+    class Config : public Core::JSON::Container {
+    public:
+        Config(const Config&) = delete;
+        Config& operator=(const Config&) = delete;
+        Config()
+            : Core::JSON::Container()
+            , Interface()
+            , DefaultTransport()
+            , VideoDecoder()
+            , AudioDecoder()
+            , VideoSink() {
+            Add(_T("interface"), &Interface);
+            Add(_T("defaulttransport"), &DefaultTransport);
+            Add(_T("videoDecoder"), &VideoDecoder);
+            Add(_T("audioDecoder"), &AudioDecoder);
+            Add(_T("videoSink"), &VideoSink);
+        }
+        Core::JSON::String Interface;
+        Core::JSON::String DefaultTransport;
+        Core::JSON::String VideoDecoder;
+        Core::JSON::String AudioDecoder;
+        Core::JSON::String VideoSink;
+    };
+
     MulticastPlayer();
     ~MulticastPlayer() override;
 
@@ -58,6 +85,8 @@ private:
 
     PluginHost::IShell* _service{ nullptr };
     std::unique_ptr<GstMulticastPipeline> _pipeline;
+    std::string _defaultInterface;
+    std::string _defaultTransport;
 };
 
 } // namespace Plugin

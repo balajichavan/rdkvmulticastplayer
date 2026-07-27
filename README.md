@@ -26,6 +26,23 @@ This separation is the key RDK pattern: the widget can be updated from a CDN
 without a firmware change, while the platform keeps full ownership of the media
 pipeline, decoder resources and multicast networking.
 
+### Cross-platform by dynamic element detection
+
+The native pipeline **auto-detects** the decode/render elements available on the
+device at runtime, so the *same* `.so` runs on Broadcom STBs, the Raspberry Pi
+reference build, and the RDK-V emulator with no code change:
+
+| Role | Detection order (first available wins) |
+|------|----------------------------------------|
+| Video decoder | `brcmvideodecoder` → `v4l2h264dec` → `omxh264dec` → `avdec_h264` |
+| Audio decoder | `brcmaudiodecoder` → `avdec_aac` |
+| Video sink | `westerossink` → `autovideosink` → `glimagesink` |
+
+`setVideoRectangle` auto-adapts to whichever geometry property the chosen sink
+exposes (`rectangle` / `window-set`) and is a safe no-op on sinks that have none
+(e.g. `autovideosink` on the emulator). Any element can be pinned explicitly via
+the plugin config (`videoDecoder` / `audioDecoder` / `videoSink`).
+
 ### Data / control flow
 
 ```
@@ -200,12 +217,10 @@ scp ../../provisioning/MulticastPlayer.plugin-config.json \
 ssh root@<pi-ip> 'systemctl restart wpeframework'
 ```
 
-> **Raspberry Pi decoder note:** the pipeline in
-> [GstMulticastPipeline.cpp](plugin/MulticastPlayer/GstMulticastPipeline.cpp)
-> defaults to Broadcom STB elements (`brcmvideodecoder` / `brcmaudiodecoder`).
-> On the Raspberry Pi RDK build use the V4L2 stateful decoder instead — change
-> the video decoder factory from `brcmvideodecoder` to **`v4l2h264dec`** (and the
-> audio decoder to a software `avdec_aac`). `westerossink` is the same on both.
+> **Raspberry Pi decoder note:** no code change is required — the pipeline
+> auto-detects `v4l2h264dec` + `westerossink` on the Pi (see *Cross-platform by
+> dynamic element detection* in §1). To pin elements explicitly, set
+> `videoDecoder` / `videoSink` in the plugin config JSON.
 
 ---
 
@@ -344,6 +359,57 @@ HOST=<pi-ip> URI=udp://239.1.1.2:5000 TRANSPORT=udp test/jsonrpc-test.sh
 3. Launch the **Multicast Live** tile on the Pi carousel and select the channel.
 4. Expect: video in the window, status `PLAYING`, and the group visible in
    `ip maddr show`. Pressing Back stops playback and leaves the group.
+
+### 7.5 Testing on the RDK-V emulator
+
+The plugin runs on the RDK-V emulator (the Yocto `qemux86` / VirtualBox RDK-V
+reference image, or a Thunder-on-Ubuntu container). There is no hardware decoder,
+so the pipeline falls back to software `avdec_h264` + `autovideosink` — this
+happens **automatically** via dynamic detection, or you can pin it with the
+provided emulator profile.
+
+**Step 1 — Build the plugin for the emulator target.** Use the emulator's
+Yocto SDK (or build natively inside the container). GStreamer `libav` plugins
+must be present:
+
+```bash
+sudo apt install -y gstreamer1.0-libav gstreamer1.0-plugins-good \
+                    gstreamer1.0-plugins-bad
+```
+
+**Step 2 — Install the plugin with the emulator config profile:**
+
+```bash
+cp build/libWPEFrameworkMulticastPlayer.so  /usr/lib/wpeframework/plugins/
+cp provisioning/MulticastPlayer.plugin-config.emulator.json \
+   /etc/WPEFramework/plugins/MulticastPlayer.json
+systemctl restart wpeframework    # or restart the Thunder container
+```
+
+The emulator profile
+([provisioning/MulticastPlayer.plugin-config.emulator.json](provisioning/MulticastPlayer.plugin-config.emulator.json))
+pins `avdec_h264` / `avdec_aac` / `autovideosink`.
+
+**Step 3 — Networking: multicast must reach the VM.** Configure the emulator
+VM's adapter as **bridged** (not NAT); NAT does not forward IGMP/multicast. Then
+run [test/multicast-server.sh](test/multicast-server.sh) on a host on the same
+bridged segment. Alternatively, run both the server and the emulator on the same
+host network namespace/container.
+
+**Step 4 — Drive it and confirm:**
+
+```bash
+HOST=<emulator-ip> test/jsonrpc-test.sh
+```
+
+You should see the sample video render in the emulator's display and status
+transition to `PLAYING`. `setVideoRectangle` calls are accepted but have no
+visible effect with `autovideosink` (no geometry property), which is expected.
+
+> **What the emulator validates:** full control path (JSON-RPC, events,
+> lifecycle), IGMP join/leave, TS demux and software decode. It does **not**
+> validate hardware decode, `westerossink` compositing or on-screen rectangle
+> geometry — verify those on the Pi or a real STB.
 
 ---
 
