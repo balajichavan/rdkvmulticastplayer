@@ -36,8 +36,76 @@ venv/
 .vscode/
 .idea/
 *.swp
+*.swo
+.swp
 .DS_Store
 Thumbs.db
+*.un~
+.*.swp
+.*swp
+
+# ---- Backups ----
+*backup*
+*bak*
+*_backup_*
+*_old_*
+*~
+*.backup
+*.bak
+
+# ---- Temp / cache files ----
+*.tmp
+*.temp
+tmp/
+cache/
+node_modules/
+
+# ---- OS temp files ----
+/system/
+/proc/
+/driver/
+
+tmp*
 
 # ---- Logs ----
 *.log
+*.logs
+logs/
+
+# ---- IDE settings ----
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.iml
+*.iws
+
+# ---- Vim ----
+.*.swp
+.*.swo
+
+# ---- Python virtual environments ----
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Compiled binaries ----
+*.so
+*.o
+*.bin
+*.out
+
+# ---- Other ----
+debug/
+release/
+prod/
+development/
+test/
+build/
+*.tgz
+*.tar.gz
+*.zip
+*.rar

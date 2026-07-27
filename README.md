@@ -10,6 +10,19 @@ The widget is **UI/control only**. All media handling — IGMP join/leave, TS
 demux, hardware decode and rendering via `westerossink` — lives in the native
 plugin. The widget drives it over Thunder JSON-RPC.
 
+## Quick Start
+
+This project provides:
+
+1. **Native Thunder plugin** (`org.rdk.MulticastPlayer`) in `plugin/MulticastPlayer/` — a C++/GStreamer pipeline that handles all media logic
+2. **Web widget** (`Multicast Live`) in `widget/` — a Lightning.js UI with channel list and video window
+3. **Testing utilities** in `test/` — multicast server and JSON-RPC test harness
+4. **Provisioning scripts** in `provisioning/` — package signing and catalog entry generation
+
+The plugin auto-detects the best video/audio decoder and video sink for the target platform (Broadcom STB → Raspberry Pi → Emulator → Software). No code changes needed across devices.
+
+See [§8 Quick Emulator Setup](#8-quick-emulator-setup) for setup instructions.
+
 ---
 
 ## 1. Project overview
@@ -413,7 +426,94 @@ visible effect with `autovideosink` (no geometry property), which is expected.
 
 ---
 
-## 8. Troubleshooting
+## 8. Quick Emulator Setup
+
+This section provides a streamlined guide to setup the RDK-V emulator for testing the multicast player plugin.
+
+### Prerequisites
+
+1. **Ubuntu 22.04 LTS** (or similar Linux distribution)
+2. VirtualBox or KVM with VT-X enabled
+3. Internet connection for downloading the RDK-V emulator image
+
+### Step 1: Create and Start the Emulator VM
+
+```bash
+# Install KVM/QEMU for better performance (if available)
+sudo apt update
+sudo apt install -y qemu kvm libvirt-daemon-system libvirt-clients
+
+# Create a new VM with RDK-V configuration
+# Use the QEMU command line options from the RDK-V emulator profile
+# Example: 2 vCPUs, 4GB RAM, 40GB disk
+qemu-system-x86_64 \
+  -m 4096M -smp 2 \
+  -drive file=/path/to/rdkv-emulator.qcow2,format=qcow2 \
+  -netdev type=tap,id=net0,script=/etc/qemu/ifup \
+  -device e1000,netdev=net0,id=net0 \
+  -vga virtio \
+  -enable-kvm
+```
+
+### Step 2: Configure Network for Multicast
+
+Important: Multicast must reach the emulator. Bridged networking is required.
+
+```bash
+# Connect the VM to a bridged network (do not use NAT)
+# On Ubuntu/Debian:
+sudo brctl addbr br0
+sudo ifconfig br0 up
+sudo iptables -t nat -A POSTROUTING -s 192.168.1.0/24 -o eth0 -j MASQUERADE
+
+# In VirtualBox, set the network adapter to "Bridged Adapter" in the VM settings
+```
+
+### Step 3: Install and Configure the Plugin
+
+```bash
+# SSH into the emulator or use VNC/SSH
+ssh root@<emulator-ip>
+
+# Install the plugin from the build
+sudo mkdir -p /usr/lib/wpeframework/plugins
+sudo cp /path/to/build/libWPEFrameworkMulticastPlayer.so /usr/lib/wpeframework/plugins/
+
+# Install the emulator profile configuration
+sudo cp /home/user/rdkvmulticastplayer/provisioning/MulticastPlayer.plugin-config.emulator.json \
+    /etc/WPEFramework/plugins/MulticastPlayer.json
+
+# Start the WPEFramework service
+sudo systemctl restart wpeframework || sudo service thunder restart
+```
+
+### Step 4: Setup Multicast Stream
+
+Run the multicast server on a host on the same bridged network:
+
+```bash
+# On the host running the emulator (or another machine on the same network)
+cd /home/user/rdkvmulticastplayer
+test/multicast-server.sh
+```
+
+### Step 5: Test the Plugin
+
+```bash
+# From the host where the emulator is running
+test/jsonrpc-test.sh HOST=<emulator-ip>
+```
+
+You should see the sample video render and status transition to `PLAYING`.
+
+**Notes:**
+- The emulator uses software decode (`avdec_h264`) + `autovideosink`
+- `setVideoRectangle` calls are accepted but have no visible effect with `autovideosink` (no geometry property)
+- Validate hardware decode, `westerossink` compositing, and rectangle geometry on a real device (Raspberry Pi or STB)
+
+---
+
+## 10. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
