@@ -101,8 +101,19 @@ Events: `onStatusChanged {state}`, `onError {code,message}`, `onEnd`.
 ## 2. Prerequisites
 
 You need a **Linux build host** (Ubuntu 20.04/22.04 recommended) to build the RDK
-image, and a **Raspberry Pi 4** (or Pi 3) as the target. RDK-V has an official
-Raspberry Pi reference build, so the Pi acts as the "equivalent RDK platform".
+image, and a **Raspberry Pi 2 Model B** (BCM2836, ARMv7 32-bit, 1 GB RAM) as the
+target.
+
+> **Target note (Raspberry Pi 2 Model B):** The official RDK-V reference is the
+> Pi 3 / Pi 4; the Pi 2 is below that baseline, so treat this as best-effort. Two
+> concrete differences drive the instructions below:
+> - It is **32-bit ARMv7** (`raspberrypi2-rdk-mc` machine, `arm-rdk-linux-gnueabi`
+>   toolchain) — not the 64-bit `raspberrypi4-64` build.
+> - Hardware H.264 decode goes through **OpenMAX / VideoCore IV** via the
+>   `omxh264dec` GStreamer element, *not* the `v4l2h264dec` path used on Pi 3/4.
+>   Pin it with the provided Pi 2 config profile (§4).
+> - The 900 MHz quad-A7 / 1 GB device is comfortable at **720p ~2–3 Mbps**; 1080p
+>   is marginal. Use the lower-rate test stream in §7.
 
 Build-host packages (Yocto/RDK requirements):
 
@@ -160,7 +171,7 @@ LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/Apache-2.0;md5=89aea4e17d99a7cacdbeed46a0096b10"
 
 DEPENDS = "wpeframework gstreamer1.0 gstreamer1.0-plugins-base"
-RDEPENDS:${PN} = "gstreamer1.0 gstreamer1.0-plugins-good gstreamer1.0-plugins-bad westeros"
+RDEPENDS:${PN} = "gstreamer1.0 gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-omx westeros"
 
 SRC_URI = "file://MulticastPlayer"
 S = "${WORKDIR}/MulticastPlayer"
@@ -183,15 +194,19 @@ IMAGE_INSTALL:append = " multicastplayer"
 
 ```bash
 cd ~/rdkv-rpi
-MACHINE=raspberrypi4-64-rdk-mc source meta-cmf-raspberrypi/setup-environment
+MACHINE=raspberrypi2-rdk-mc source meta-cmf-raspberrypi/setup-environment
 # choose the rdkv image when prompted, then:
 bitbake rdk-generic-mediaclient-wpe-image
 ```
 
+> Ensure OpenMAX HW decode is enabled and give the GPU enough memory: set
+> `gpu_mem=256` (and `start_x=1`) in the image's `config.txt`. gstreamer1.0-omx
+> must be in the image (added via RDEPENDS in Step 3.2).
+
 **Step 3.4 — Flash to SD card**
 
 ```bash
-cd ~/rdkv-rpi/build-*/tmp/deploy/images/raspberrypi4-64-rdk-mc
+cd ~/rdkv-rpi/build-*/tmp/deploy/images/raspberrypi2-rdk-mc
 sudo bmaptool copy rdk-generic-mediaclient-wpe-image-*.wic.bz2 /dev/sdX
 # (replace /dev/sdX with your SD card device — double-check with lsblk!)
 ```
@@ -208,10 +223,10 @@ plugin without a full image rebuild.
 ```bash
 # On the build host, generate & install the cross SDK
 bitbake rdk-generic-mediaclient-wpe-image -c populate_sdk
-./tmp/deploy/sdk/rdk-glibc-x86_64-*-raspberrypi4-64-toolchain-*.sh   # installs to /opt/rdk/...
+./tmp/deploy/sdk/rdk-glibc-x86_64-*-raspberrypi2-toolchain-*.sh   # installs to /opt/rdk/...
 
-# Cross-compile the plugin
-source /opt/rdk/*/environment-setup-*-rdk-linux
+# Cross-compile the plugin (32-bit armv7 target)
+source /opt/rdk/*/environment-setup-*-rdk-linux-gnueabi
 cd ~/proposals/playeruiapp/plugin/MulticastPlayer
 cmake -B build \
   -DCMAKE_TOOLCHAIN_FILE="$OECORE_NATIVE_SYSROOT/usr/share/cmake/OEToolchainConfig.cmake" \
@@ -220,20 +235,23 @@ cmake --build build -j$(nproc)
 # -> build/libWPEFrameworkMulticastPlayer.so
 ```
 
-Copy the artifacts to the Pi and register the plugin:
+Copy the artifacts to the Pi and register the plugin (use the Pi 2 profile):
 
 ```bash
 scp build/libWPEFrameworkMulticastPlayer.so \
     root@<pi-ip>:/usr/lib/wpeframework/plugins/
-scp ../../provisioning/MulticastPlayer.plugin-config.json \
+scp ../../provisioning/MulticastPlayer.plugin-config.rpi2.json \
     root@<pi-ip>:/etc/WPEFramework/plugins/MulticastPlayer.json
 ssh root@<pi-ip> 'systemctl restart wpeframework'
 ```
 
-> **Raspberry Pi decoder note:** no code change is required — the pipeline
-> auto-detects `v4l2h264dec` + `westerossink` on the Pi (see *Cross-platform by
-> dynamic element detection* in §1). To pin elements explicitly, set
-> `videoDecoder` / `videoSink` in the plugin config JSON.
+> **Raspberry Pi 2 decoder note:** the Pi 2 has no V4L2 stateful codec driver, so
+> the HW path is **OpenMAX `omxh264dec`** (from `gstreamer1.0-omx`). The provided
+> [provisioning/MulticastPlayer.plugin-config.rpi2.json](provisioning/MulticastPlayer.plugin-config.rpi2.json)
+> pins `omxh264dec` + `westerossink`. Auto-detection would otherwise try
+> `v4l2h264dec` first, which is absent on the Pi 2, so pinning avoids a needless
+> probe. If `omxh264dec` is unavailable it falls back to software `avdec_h264`
+> (expect 720p-only performance).
 
 ---
 
@@ -340,6 +358,14 @@ Public sample sources used:
 
 > Requires `ffmpeg` (preferred) or `gstreamer1.0-tools` on the streaming host:
 > `sudo apt install ffmpeg`.
+
+> **Raspberry Pi 2 tip:** keep the feed at **720p and ~2\u20133 Mbps** so the
+> Pi 2's decoder/network keep up. The default Big Buck Bunny sample is already
+> 720p; cap the bitrate with `BITRATE`:
+>
+> ```bash
+> BITRATE=2500k test/multicast-server.sh
+> ```
 
 ### 7.2 Confirm the feed locally (optional)
 
