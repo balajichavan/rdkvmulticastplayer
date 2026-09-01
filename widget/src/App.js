@@ -11,7 +11,7 @@ import MulticastService from './lib/MulticastService.js'
 import channels from './lib/channels.js'
 
 // 1080p design canvas. westerossink renders on the video plane behind graphics.
-const VIDEO_RECT = { x: 460, y: 120, w: 1380, h: 780 }
+const VIDEO_RECT = { x: 0, y: 0, w: 1920, h: 1080 }
 
 export default class App extends Lightning.Component {
   static _template() {
@@ -131,7 +131,11 @@ export default class App extends Lightning.Component {
   }
 
   async _handleBack() {
+    //await this._service.stop()
     await this._service.stop()
+    await this._service.close()
+    this.tag('Placeholder').alpha = 1
+    this._setStatus('STOPPED')
   }
 
   // --- Playback control -----------------------------------------------------

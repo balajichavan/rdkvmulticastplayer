@@ -5,16 +5,20 @@
  * the native `org.rdk.MulticastPlayer` plugin. The widget never touches the
  * media pipeline directly; it only issues control calls and listens to events.
  */
-import ThunderJS from 'ThunderJS'
+/*import ThunderJS from 'thunderjs'*/
+/*import ThunderJS from 'thunderjs'*/
+import ThunderJS from '../vendor/thunderJS.js'
 
 const CALLSIGN = 'org.rdk.MulticastPlayer'
 
 export default class MulticastService {
   constructor(config = {}) {
     this._thunder = ThunderJS({
-      host: config.host || '127.0.0.1',
+     /* host: config.host || '127.0.0.1',*/
+      host: window.location.hostname,
       port: config.port || 9998,
-      token: config.token || undefined,
+      /*token: config.token || undefined,*/
+      endpoint: '/jsonrpc'
     })
     this._listeners = {}
     this._subscribed = false

@@ -1,379 +1,1637 @@
 /**
  * GstMulticastPipeline.cpp
  *
- * Implementation of the native multicast GStreamer pipeline used by the
+ * Native multicast GStreamer pipeline used by the
  * MulticastPlayer Thunder plugin.
  *
- * Pipeline (UDP-TS):
- *   udpsrc address=<group> port=<port> multicast-iface=<iface>
- *          caps="video/mpegts, systemstream=true"
- *     ! tsdemux name=demux
- *        demux. ! queue ! h264parse ! brcmvideodecoder ! westerossink
- *        demux. ! queue ! aacparse   ! brcmaudiodecoder ! amlhalasink/audiosink
+ * VBO/FEIP:
  *
- * Pipeline (RTP-TS): identical but with rtpmp2tdepay between udpsrc and tsdemux
- * and RTP caps on udpsrc.
+ *   feiptsrc -> tsparse -> tsdemux
  *
- * Element names assume a Broadcom SoC. Swap brcm*/westerossink for the target
- * platform's sinks if building for Amlogic/Realtek.
+ * VIDEO:
+ *
+ *   tsdemux -> queue -> h264parse -> video sink
+ *
+ * AUDIO:
+ *
+ *   tsdemux -> queue -> mpegaudioparse -> decoder
+ *           -> audioconvert -> audioresample
+ *           -> queue -> capsfilter -> alsasink
+ *
+ * The feiptsrc element is the Nokia VBO/FEIP to
+ * GStreamer bridge.
  */
+
 #include "GstMulticastPipeline.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace WPEFramework {
 namespace Plugin {
 
 namespace {
+
 constexpr int kErrPipelineBuild = 1001;
-constexpr int kErrStateChange = 1002;
-constexpr int kErrStream = 1003;
+constexpr int kErrStateChange   = 1002;
+constexpr int kErrStream        = 1003;
 
-// Link a freshly created tsdemux pad to the decode branch that is waiting for it.
-void OnDemuxPadAdded(GstElement* /*demux*/, GstPad* pad, gpointer user_data) {
-    GstElement* target = static_cast<GstElement*>(user_data);
-    GstPad* sinkPad = gst_element_get_static_pad(target, "sink");
-    if (sinkPad != nullptr) {
-        if (gst_pad_is_linked(sinkPad) == FALSE) {
-            gst_pad_link(pad, sinkPad);
-        }
-        gst_object_unref(sinkPad);
+
+/*
+ * Link a dynamic tsdemux pad to a queue.
+ */
+void LinkDemuxPadToQueue(
+    GstPad* pad,
+    GstElement* queue)
+{
+    if (pad == nullptr || queue == nullptr) {
+        return;
     }
-}
-} // namespace
 
-GstMulticastPipeline::GstMulticastPipeline() {
+    GstPad* sinkPad =
+        gst_element_get_static_pad(
+            queue,
+            "sink");
+
+    if (sinkPad == nullptr) {
+        printf(
+            "MulticastPlayer: failed to get "
+            "queue sink pad\n");
+
+        return;
+    }
+
+    if (!gst_pad_is_linked(sinkPad)) {
+
+        GstPadLinkReturn ret =
+            gst_pad_link(
+                pad,
+                sinkPad);
+
+        printf(
+            "MulticastPlayer: pad link result = %d\n",
+            ret);
+
+        if (ret != GST_PAD_LINK_OK) {
+            printf(
+                "MulticastPlayer: failed to "
+                "link demux pad\n");
+        }
+    }
+
+    gst_object_unref(sinkPad);
+}
+
+} // anonymous namespace
+
+
+GstMulticastPipeline::GstMulticastPipeline()
+{
     if (gst_is_initialized() == FALSE) {
         gst_init(nullptr, nullptr);
     }
 }
 
-GstMulticastPipeline::~GstMulticastPipeline() {
+
+GstMulticastPipeline::~GstMulticastPipeline()
+{
     Close();
 }
 
-void GstMulticastPipeline::SetElementProfile(const std::string& videoDecoder,
-    const std::string& audioDecoder, const std::string& videoSink) {
+
+void GstMulticastPipeline::SetElementProfile(
+    const std::string& videoDecoder,
+    const std::string& audioDecoder,
+    const std::string& videoSink)
+{
     std::lock_guard<std::mutex> guard(_lock);
+
     _videoDecoderOverride = videoDecoder;
     _audioDecoderOverride = audioDecoder;
-    _videoSinkOverride = videoSink;
+    _videoSinkOverride    = videoSink;
 }
 
-GstElement* GstMulticastPipeline::MakeFirstAvailable(const std::string& override,
-    const std::vector<std::string>& candidates, const char* elementName,
-    std::string& chosen) {
-    // If an override is configured, try only that; otherwise walk the platform
-    // preference list (Broadcom STB -> Raspberry Pi V4L2 -> generic/software)
-    // and pick the first factory that is actually registered on this device.
+
+GstElement* GstMulticastPipeline::MakeFirstAvailable(
+    const std::string& override,
+    const std::vector<std::string>& candidates,
+    const char* elementName,
+    std::string& chosen)
+{
     std::vector<std::string> order;
-    if (override.empty() == false) {
+
+    if (!override.empty()) {
         order.push_back(override);
     } else {
         order = candidates;
     }
+
     for (const std::string& name : order) {
-        GstElement* element = gst_element_factory_make(name.c_str(), elementName);
+
+        GstElement* element =
+            gst_element_factory_make(
+                name.c_str(),
+                elementName);
+
         if (element != nullptr) {
+
             chosen = name;
+
+            printf(
+                "MulticastPlayer: selected %s = %s\n",
+                elementName,
+                name.c_str());
+
             return element;
         }
     }
+
     chosen.clear();
+
+    printf(
+        "MulticastPlayer: no element available "
+        "for %s\n",
+        elementName);
+
     return nullptr;
 }
 
-bool GstMulticastPipeline::ApplyRectangleToSink() {
-    // Called with _lock held. autovideosink/glimagesink have no geometry
-    // property, in which case _rectProperty is null and this is a no-op.
-    if (_videoSink == nullptr || _rectProperty == nullptr) {
+
+bool GstMulticastPipeline::ApplyRectangleToSink()
+{
+    /*
+     * Called with _lock held.
+     */
+
+    if (_videoSink == nullptr ||
+        _rectProperty == nullptr) {
+
         return true;
     }
+
     gchar rect[64];
-    std::snprintf(rect, sizeof(rect), "%d,%d,%d,%d", _rectX, _rectY, _rectW, _rectH);
-    g_object_set(G_OBJECT(_videoSink), _rectProperty, rect, nullptr);
+
+    std::snprintf(
+        rect,
+        sizeof(rect),
+        "%d,%d,%d,%d",
+        _rectX,
+        _rectY,
+        _rectW,
+        _rectH);
+
+    g_object_set(
+        G_OBJECT(_videoSink),
+        _rectProperty,
+        rect,
+        nullptr);
+
+    printf(
+        "MulticastPlayer: video rectangle = %s\n",
+        rect);
+
     return true;
 }
 
-bool GstMulticastPipeline::ParseUri(const std::string& uri, std::string& host, int& port) const {
-    // Accept "udp://host:port" or "rtp://host:port" or bare "host:port".
+
+bool GstMulticastPipeline::ParseUri(
+    const std::string& uri,
+    std::string& host,
+    int& port) const
+{
     std::string work = uri;
-    const auto scheme = work.find("://");
+
+    const auto scheme =
+        work.find("://");
+
     if (scheme != std::string::npos) {
-        work = work.substr(scheme + 3);
+        work =
+            work.substr(scheme + 3);
     }
-    const auto colon = work.rfind(':');
+
+    const auto colon =
+        work.rfind(':');
+
     if (colon == std::string::npos) {
         return false;
     }
-    host = work.substr(0, colon);
-    port = std::atoi(work.substr(colon + 1).c_str());
-    return (!host.empty() && port > 0 && port <= 65535);
+
+    host =
+        work.substr(0, colon);
+
+    port =
+        std::atoi(
+            work.substr(
+                colon + 1).c_str());
+
+    return (
+        !host.empty() &&
+        port > 0 &&
+        port <= 65535);
 }
 
-bool GstMulticastPipeline::Open(const std::string& uri, Transport transport, const std::string& iface) {
+
+/*
+ * tsdemux creates pads dynamically.
+ *
+ * We inspect the caps of each pad and decide whether
+ * it is a video or audio stream.
+ */
+void GstMulticastPipeline::OnDemuxPadAdded(
+    GstElement* /*demux*/,
+    GstPad* pad,
+    gpointer userData)
+{
+    GstMulticastPipeline* self =
+        static_cast<GstMulticastPipeline*>(
+            userData);
+
+    if (self == nullptr ||
+        pad == nullptr) {
+
+        return;
+    }
+
+    GstCaps* caps =
+        gst_pad_get_current_caps(pad);
+
+    if (caps == nullptr) {
+
+        caps =
+            gst_pad_query_caps(
+                pad,
+                nullptr);
+    }
+
+    if (caps == nullptr ||
+        gst_caps_is_empty(caps)) {
+
+        printf(
+            "MulticastPlayer: demux pad "
+            "has no caps\n");
+
+        if (caps != nullptr) {
+            gst_caps_unref(caps);
+        }
+
+        return;
+    }
+
+    const GstStructure* structure =
+        gst_caps_get_structure(
+            caps,
+            0);
+
+    if (structure == nullptr) {
+
+        gst_caps_unref(caps);
+        return;
+    }
+
+    const gchar* name =
+        gst_structure_get_name(
+            structure);
+
+    printf(
+        "MulticastPlayer: tsdemux "
+        "pad-added: %s\n",
+        name != nullptr
+            ? name
+            : "unknown");
+
+
+    /*
+     * -------------------------------------------------
+     * VIDEO
+     * -------------------------------------------------
+     */
+
+    if (name != nullptr &&
+        std::strstr(
+            name,
+            "video") != nullptr) {
+
+        printf(
+            "MulticastPlayer: VIDEO "
+            "pad detected\n");
+
+        LinkDemuxPadToQueue(
+            pad,
+            self->_videoQueue);
+    }
+
+
+    /*
+     * -------------------------------------------------
+     * AUDIO
+     * -------------------------------------------------
+     */
+
+    else if (name != nullptr &&
+             std::strstr(
+                 name,
+                 "audio") != nullptr) {
+
+        gint mpegVersion = 0;
+        gint layer = 0;
+
+        gst_structure_get_int(
+            structure,
+            "mpegversion",
+            &mpegVersion);
+
+        gst_structure_get_int(
+            structure,
+            "layer",
+            &layer);
+
+        printf(
+            "MulticastPlayer: AUDIO pad "
+            "detected mpegversion=%d "
+            "layer=%d\n",
+            mpegVersion,
+            layer);
+
+        if (std::strstr(
+                name,
+                "audio/mpeg") != nullptr &&
+            mpegVersion == 1 &&
+            layer == 2) {
+
+            printf(
+                "MulticastPlayer: "
+                "MP2 AUDIO pad detected\n");
+        }
+
+        /*
+         * mpegaudioparse performs the final
+         * negotiation.
+         */
+        LinkDemuxPadToQueue(
+            pad,
+            self->_audioQueue);
+    }
+
+
+    /*
+     * -------------------------------------------------
+     * OTHER
+     * -------------------------------------------------
+     */
+
+    else {
+
+        printf(
+            "MulticastPlayer: ignoring "
+            "demux stream: %s\n",
+            name != nullptr
+                ? name
+                : "unknown");
+    }
+
+    gst_caps_unref(caps);
+}
+
+
+/*
+ * -----------------------------------------------------
+ * OPEN
+ * -----------------------------------------------------
+ *
+ * New VBO architecture:
+ *
+ *     feiptsrc
+ *         |
+ *      tsparse
+ *         |
+ *      tsdemux
+ *       /    \
+ *    video   audio
+ *
+ * The URI is still used to provide the multicast
+ * channel IP and port.
+ *
+ * The actual data source is now feiptsrc.
+ */
+bool GstMulticastPipeline::Open(
+    const std::string& uri,
+    Transport /*transport*/,
+    const std::string& iface)
+{
     std::lock_guard<std::mutex> guard(_lock);
 
     if (_pipeline != nullptr) {
         Cleanup();
     }
 
-    if (ParseUri(uri, _host, _port) == false) {
+    /*
+     * Parse:
+     *
+     * udp://239.x.x.x:8433
+     *
+     * or:
+     *
+     * rtp://239.x.x.x:8433
+     *
+     *
+     * The scheme is no longer used to select
+     * udpsrc/rtpmp2tdepay.
+     *
+     * It is only used to extract IP and port.
+     */
+
+    if (!ParseUri(
+            uri,
+            _host,
+            _port)) {
+
         if (_onError) {
-            _onError(kErrPipelineBuild, "Invalid multicast URI: " + uri);
+
+            _onError(
+                kErrPipelineBuild,
+                "Invalid multicast URI: " + uri);
         }
+
         SetState(State::Error);
+
         return false;
     }
+
     _iface = iface;
 
-    Transport effective = transport;
-    if (effective == Transport::Auto) {
-        effective = (uri.rfind("rtp://", 0) == 0) ? Transport::Rtp : Transport::Udp;
-    }
 
-    _pipeline = gst_pipeline_new("multicast-player");
-    _source = gst_element_factory_make("udpsrc", "src");
-    GstElement* depay = (effective == Transport::Rtp)
-        ? gst_element_factory_make("rtpmp2tdepay", "depay")
-        : nullptr;
-    GstElement* demux = gst_element_factory_make("tsdemux", "demux");
+    printf(
+        "==================================================\n");
 
-    GstElement* vqueue = gst_element_factory_make("queue", "vqueue");
-    GstElement* vparse = gst_element_factory_make("h264parse", "vparse");
-    GstElement* vdec = MakeFirstAvailable(_videoDecoderOverride,
-        { "brcmvideodecoder", "v4l2h264dec", "omxh264dec", "avdec_h264" },
-        "vdec", _chosenVideoDecoder);
-    _videoSink = MakeFirstAvailable(_videoSinkOverride,
-        { "westerossink", "autovideosink", "glimagesink" },
-        "vsink", _chosenVideoSink);
+    printf(
+        "MulticastPlayer: Opening VBO stream\n");
 
-    GstElement* aqueue = gst_element_factory_make("queue", "aqueue");
-    GstElement* aparse = gst_element_factory_make("aacparse", "aparse");
-    GstElement* adec = MakeFirstAvailable(_audioDecoderOverride,
-        { "brcmaudiodecoder", "avdec_aac" },
-        "adec", _chosenAudioDecoder);
-    std::string chosenAudioSink;
-    GstElement* asink = MakeFirstAvailable("",
-        { "amlhalasink", "autoaudiosink" },
-        "asink", chosenAudioSink);
+    printf(
+        "URI       : %s\n",
+        uri.c_str());
 
-    if (_pipeline == nullptr || _source == nullptr || demux == nullptr ||
-        vqueue == nullptr || vdec == nullptr || _videoSink == nullptr) {
+    printf(
+        "Group     : %s\n",
+        _host.c_str());
+
+    printf(
+        "Port      : %d\n",
+        _port);
+
+    printf(
+        "Interface : %s\n",
+        _iface.empty()
+            ? "default"
+            : _iface.c_str());
+
+    printf(
+        "Source    : feiptsrc\n");
+
+    printf(
+        "Pipeline  : feiptsrc -> tsparse -> tsdemux\n");
+
+    printf(
+        "==================================================\n");
+
+
+    /*
+     * -------------------------------------------------
+     * CREATE PIPELINE
+     * -------------------------------------------------
+     */
+
+    _pipeline =
+        gst_pipeline_new(
+            "multicast-player");
+
+
+    /*
+     * Nokia VBO/FEIP GStreamer source.
+     */
+    _source =
+        gst_element_factory_make(
+            "feiptsrc",
+            "feip-source");
+
+
+    /*
+     * MPEG-TS parser.
+     */
+    _tsParse =
+        gst_element_factory_make(
+            "tsparse",
+            "tsparse");
+
+
+    /*
+     * MPEG-TS demux.
+     */
+    _demux =
+        gst_element_factory_make(
+            "tsdemux",
+            "demux");
+
+
+    /*
+     * No UDP/RTP depayloader is required.
+     */
+    _depay = nullptr;
+
+
+    /*
+     * -------------------------------------------------
+     * VIDEO
+     * -------------------------------------------------
+     */
+
+    _videoQueue =
+        gst_element_factory_make(
+            "queue",
+            "vqueue");
+
+    _videoParse =
+        gst_element_factory_make(
+            "h264parse",
+            "vparse");
+
+    _videoSink =
+        MakeFirstAvailable(
+            _videoSinkOverride,
+            {
+                "westerossink",
+                "autovideosink",
+                "glimagesink"
+            },
+            "vsink",
+            _chosenVideoSink);
+
+
+    /*
+     * -------------------------------------------------
+     * AUDIO
+     * -------------------------------------------------
+     */
+
+    _audioQueue =
+        gst_element_factory_make(
+            "queue",
+            "aqueue");
+
+    _audioParse =
+        gst_element_factory_make(
+            "mpegaudioparse",
+            "aparse");
+
+    _audioDecoder =
+        MakeFirstAvailable(
+            _audioDecoderOverride,
+            {
+                "brcmaudiodecoder",
+                "avdec_mp2float"
+            },
+            "adec",
+            _chosenAudioDecoder);
+
+    _audioConvert =
+        gst_element_factory_make(
+            "audioconvert",
+            "aconv");
+
+    _audioResample =
+        gst_element_factory_make(
+            "audioresample",
+            "aresample");
+
+    _audioQueue2 =
+        gst_element_factory_make(
+            "queue",
+            "aqueue2");
+
+    _audioCaps =
+        gst_element_factory_make(
+            "capsfilter",
+            "acaps");
+
+    _audioSink =
+        gst_element_factory_make(
+            "alsasink",
+            "asink");
+
+
+    /*
+     * -------------------------------------------------
+     * DEBUG
+     * -------------------------------------------------
+     */
+
+    printf(
+        "MulticastPlayer elements:\n");
+
+    printf(
+        "  pipeline     = %p\n",
+        _pipeline);
+
+    printf(
+        "  feiptsrc     = %p\n",
+        _source);
+
+    printf(
+        "  tsparse      = %p\n",
+        _tsParse);
+
+    printf(
+        "  tsdemux      = %p\n",
+        _demux);
+
+    printf(
+        "  videoQueue   = %p\n",
+        _videoQueue);
+
+    printf(
+        "  videoParse   = %p\n",
+        _videoParse);
+
+    printf(
+        "  videoSink    = %p (%s)\n",
+        _videoSink,
+        _chosenVideoSink.c_str());
+
+    printf(
+        "  audioQueue   = %p\n",
+        _audioQueue);
+
+    printf(
+        "  audioParse   = %p\n",
+        _audioParse);
+
+    printf(
+        "  audioDecoder = %p (%s)\n",
+        _audioDecoder,
+        _chosenAudioDecoder.c_str());
+
+    printf(
+        "  audioConvert = %p\n",
+        _audioConvert);
+
+    printf(
+        "  audioResamp  = %p\n",
+        _audioResample);
+
+    printf(
+        "  audioQueue2  = %p\n",
+        _audioQueue2);
+
+    printf(
+        "  audioCaps    = %p\n",
+        _audioCaps);
+
+    printf(
+        "  audioSink    = %p\n",
+        _audioSink);
+
+
+    /*
+     * -------------------------------------------------
+     * VALIDATE
+     * -------------------------------------------------
+     */
+
+    if (_pipeline == nullptr ||
+        _source == nullptr ||
+        _tsParse == nullptr ||
+        _demux == nullptr ||
+        _videoQueue == nullptr ||
+        _videoParse == nullptr ||
+        _videoSink == nullptr ||
+        _audioQueue == nullptr ||
+        _audioParse == nullptr ||
+        _audioDecoder == nullptr ||
+        _audioConvert == nullptr ||
+        _audioResample == nullptr ||
+        _audioQueue2 == nullptr ||
+        _audioCaps == nullptr ||
+        _audioSink == nullptr) {
+
         if (_onError) {
-            _onError(kErrPipelineBuild, "Failed to create one or more GStreamer elements");
+
+            _onError(
+                kErrPipelineBuild,
+                "Failed to create one or more "
+                "VBO/GStreamer elements");
         }
+
         Cleanup();
+
         SetState(State::Error);
+
         return false;
     }
 
-    // Configure the multicast source.
-    g_object_set(G_OBJECT(_source),
-        "address", _host.c_str(),
-        "port", _port,
-        "auto-multicast", TRUE,      // join on READY->PAUSED, leave on PAUSED->READY
-        "reuse", TRUE,
+
+    /*
+     * -------------------------------------------------
+     * CONFIGURE FEIP SOURCE
+     * -------------------------------------------------
+     *
+     * These properties are implemented by
+     * gstfeiptsrc.c.
+     *
+     * gstfeiptsrc handles:
+     *
+     *     feip_init()
+     *     feip_connect()
+     *     feip_set_parameters()
+     *     feip_start_ts_inject()
+     *
+     * when the source goes to PLAYING.
+     */
+
+    g_object_set(
+        G_OBJECT(_source),
+
+        "feip-index",
+        0,
+
+        "dmx-id",
+        0,
+
+        "dst-ip",
+        _host.c_str(),
+
+        "dst-port",
+        _port,
+
+        "burst-packets",
+        1024,
+
         nullptr);
-    if (!_iface.empty()) {
-        g_object_set(G_OBJECT(_source), "multicast-iface", _iface.c_str(), nullptr);
+
+
+    /*
+     * -------------------------------------------------
+     * TSPARSE
+     * -------------------------------------------------
+     */
+
+    if (g_object_class_find_property(
+            G_OBJECT_GET_CLASS(_tsParse),
+            "set-timestamps") != nullptr) {
+
+        g_object_set(
+            G_OBJECT(_tsParse),
+            "set-timestamps",
+            TRUE,
+            nullptr);
     }
 
-    if (effective == Transport::Rtp) {
-        GstCaps* caps = gst_caps_new_simple("application/x-rtp",
-            "media", G_TYPE_STRING, "video",
-            "clock-rate", G_TYPE_INT, 90000,
-            "encoding-name", G_TYPE_STRING, "MP2T",
-            nullptr);
-        g_object_set(G_OBJECT(_source), "caps", caps, nullptr);
-        gst_caps_unref(caps);
-    } else {
-        GstCaps* caps = gst_caps_new_simple("video/mpegts",
-            "systemstream", G_TYPE_BOOLEAN, TRUE,
-            nullptr);
-        g_object_set(G_OBJECT(_source), "caps", caps, nullptr);
-        gst_caps_unref(caps);
-    }
 
-    // Detect which geometry property (if any) the chosen sink exposes.
+    /*
+     * -------------------------------------------------
+     * VIDEO SINK GEOMETRY
+     * -------------------------------------------------
+     */
+
     _rectProperty = nullptr;
+
     if (_videoSink != nullptr) {
-        GObjectClass* klass = G_OBJECT_GET_CLASS(_videoSink);
-        if (g_object_class_find_property(klass, "rectangle") != nullptr) {
-            _rectProperty = "rectangle";
-        } else if (g_object_class_find_property(klass, "window-set") != nullptr) {
-            _rectProperty = "window-set";
+
+        GObjectClass* klass =
+            G_OBJECT_GET_CLASS(
+                _videoSink);
+
+        if (g_object_class_find_property(
+                klass,
+                "rectangle") != nullptr) {
+
+            _rectProperty =
+                "rectangle";
+
+        } else if (
+            g_object_class_find_property(
+                klass,
+                "window-set") != nullptr) {
+
+            _rectProperty =
+                "window-set";
         }
     }
 
-    // Apply any previously requested rectangle to the sink.
-    if (_rectW > 0 && _rectH > 0) {
+    if (_rectW > 0 &&
+        _rectH > 0) {
+
         ApplyRectangleToSink();
     }
 
-    // Assemble the bin.
-    gst_bin_add_many(GST_BIN(_pipeline), _source, demux,
-        vqueue, vparse, vdec, _videoSink,
-        aqueue, aparse, adec, asink, nullptr);
-    if (depay != nullptr) {
-        gst_bin_add(GST_BIN(_pipeline), depay);
+
+    /*
+     * -------------------------------------------------
+     * VIDEO QUEUE
+     * -------------------------------------------------
+     */
+
+    g_object_set(
+        G_OBJECT(_videoQueue),
+
+        "leaky",
+        0,
+
+        "max-size-buffers",
+        2000,
+
+        "max-size-bytes",
+        0,
+
+        "max-size-time",
+        0,
+
+        nullptr);
+
+
+    /*
+     * -------------------------------------------------
+     * AUDIO QUEUES
+     * -------------------------------------------------
+     */
+
+    g_object_set(
+        G_OBJECT(_audioQueue),
+
+        "leaky",
+        0,
+
+        "max-size-buffers",
+        8000,
+
+        "max-size-bytes",
+        0,
+
+        "max-size-time",
+        0,
+
+        nullptr);
+
+    g_object_set(
+        G_OBJECT(_audioQueue2),
+
+        "leaky",
+        0,
+
+        "max-size-buffers",
+        8000,
+
+        "max-size-bytes",
+        0,
+
+        "max-size-time",
+        0,
+
+        nullptr);
+
+
+    /*
+     * -------------------------------------------------
+     * H264 PARSER
+     * -------------------------------------------------
+     */
+
+    g_object_set(
+        G_OBJECT(_videoParse),
+
+        "config-interval",
+        1,
+
+        "disable-passthrough",
+        TRUE,
+
+        nullptr);
+
+
+    /*
+     * -------------------------------------------------
+     * AUDIO CAPS
+     * -------------------------------------------------
+     */
+
+    GstCaps* audioCaps =
+        gst_caps_from_string(
+            "audio/x-raw,"
+            "channels=2,"
+            "format=S16LE,"
+            "rate=48000");
+
+    g_object_set(
+        G_OBJECT(_audioCaps),
+        "caps",
+        audioCaps,
+        nullptr);
+
+    gst_caps_unref(audioCaps);
+
+
+    /*
+     * -------------------------------------------------
+     * ALSA
+     * -------------------------------------------------
+     */
+
+    g_object_set(
+        G_OBJECT(_audioSink),
+        "device",
+        "hw:1,0",
+        nullptr);
+
+    GObjectClass* audioSinkClass =
+        G_OBJECT_GET_CLASS(
+            _audioSink);
+
+    if (g_object_class_find_property(
+            audioSinkClass,
+            "sync") != nullptr) {
+
+        g_object_set(
+            G_OBJECT(_audioSink),
+            "sync",
+            FALSE,
+            nullptr);
     }
 
-    // Link the source chain up to tsdemux.
-    gboolean linked = TRUE;
-    if (depay != nullptr) {
-        linked = gst_element_link(_source, depay) && gst_element_link(depay, demux);
-    } else {
-        linked = gst_element_link(_source, demux);
+    if (g_object_class_find_property(
+            audioSinkClass,
+            "async") != nullptr) {
+
+        g_object_set(
+            G_OBJECT(_audioSink),
+            "async",
+            FALSE,
+            nullptr);
     }
 
-    // Link the static decode branches; demux src pads are dynamic.
-    linked = linked && gst_element_link_many(vqueue, vparse, vdec, _videoSink, nullptr);
-    linked = linked && gst_element_link_many(aqueue, aparse, adec, asink, nullptr);
-    if (linked == FALSE) {
-        if (_onError) {
-            _onError(kErrPipelineBuild, "Failed to link static pipeline elements");
+    if (g_object_class_find_property(
+            audioSinkClass,
+            "enable-last-sample") != nullptr) {
+
+        g_object_set(
+            G_OBJECT(_audioSink),
+            "enable-last-sample",
+            FALSE,
+            nullptr);
+    }
+
+
+    /*
+     * -------------------------------------------------
+     * VIDEO SINK
+     * -------------------------------------------------
+     */
+
+    if (_videoSink != nullptr) {
+
+        GObjectClass* videoSinkClass =
+            G_OBJECT_GET_CLASS(
+                _videoSink);
+
+        if (g_object_class_find_property(
+                videoSinkClass,
+                "sync") != nullptr) {
+
+            g_object_set(
+                G_OBJECT(_videoSink),
+                "sync",
+                TRUE,
+                nullptr);
         }
+
+        if (g_object_class_find_property(
+                videoSinkClass,
+                "async") != nullptr) {
+
+            g_object_set(
+                G_OBJECT(_videoSink),
+                "async",
+                FALSE,
+                nullptr);
+        }
+
+        if (g_object_class_find_property(
+                videoSinkClass,
+                "enable-last-sample") != nullptr) {
+
+            g_object_set(
+                G_OBJECT(_videoSink),
+                "enable-last-sample",
+                FALSE,
+                nullptr);
+        }
+
+        if (g_object_class_find_property(
+                videoSinkClass,
+                "zorder") != nullptr) {
+
+            g_object_set(
+                G_OBJECT(_videoSink),
+                "zorder",
+                1.0f,
+                nullptr);
+        }
+
+        if (g_object_class_find_property(
+                videoSinkClass,
+                "opacity") != nullptr) {
+
+            g_object_set(
+                G_OBJECT(_videoSink),
+                "opacity",
+                1.0f,
+                nullptr);
+        }
+    }
+
+
+    /*
+     * -------------------------------------------------
+     * ADD ELEMENTS
+     * -------------------------------------------------
+     */
+
+    gst_bin_add_many(
+        GST_BIN(_pipeline),
+
+        _source,
+        _tsParse,
+        _demux,
+
+        _videoQueue,
+        _videoParse,
+        _videoSink,
+
+        _audioQueue,
+        _audioParse,
+        _audioDecoder,
+        _audioConvert,
+        _audioResample,
+        _audioQueue2,
+        _audioCaps,
+        _audioSink,
+
+        nullptr);
+
+
+    /*
+     * -------------------------------------------------
+     * FEIP SOURCE -> TSPARSE -> TSDEMUX
+     * -------------------------------------------------
+     */
+
+    gboolean linked =
+        gst_element_link_many(
+            _source,
+            _tsParse,
+            _demux,
+            nullptr);
+
+
+    /*
+     * -------------------------------------------------
+     * VIDEO STATIC LINK
+     * -------------------------------------------------
+     */
+
+    linked =
+        linked &&
+        gst_element_link_many(
+            _videoQueue,
+            _videoParse,
+            _videoSink,
+            nullptr);
+
+
+    /*
+     * -------------------------------------------------
+     * AUDIO STATIC LINK
+     * -------------------------------------------------
+     */
+
+    linked =
+        linked &&
+        gst_element_link_many(
+            _audioQueue,
+            _audioParse,
+            _audioDecoder,
+            _audioConvert,
+            _audioResample,
+            _audioQueue2,
+            _audioCaps,
+            _audioSink,
+            nullptr);
+
+
+    if (!linked) {
+
+        printf(
+            "MulticastPlayer: "
+            "STATIC LINK FAILED\n");
+
+        if (_onError) {
+
+            _onError(
+                kErrPipelineBuild,
+                "Failed to link "
+                "VBO/GStreamer pipeline");
+        }
+
         Cleanup();
+
         SetState(State::Error);
+
         return false;
     }
 
-    // Hook dynamic pads from tsdemux to the correct branch queue.
-    g_signal_connect(demux, "pad-added", G_CALLBACK(+[](GstElement* d, GstPad* pad, gpointer data) {
-        auto** branches = static_cast<GstElement**>(data);
-        GstCaps* caps = gst_pad_get_current_caps(pad);
-        if (caps == nullptr) {
-            caps = gst_pad_query_caps(pad, nullptr);
-        }
-        const gchar* name = (caps != nullptr) ? gst_structure_get_name(gst_caps_get_structure(caps, 0)) : "";
-        GstElement* target = nullptr;
-        if (name != nullptr && std::strstr(name, "audio") != nullptr) {
-            target = branches[1]; // aqueue
-        } else {
-            target = branches[0]; // vqueue
-        }
-        if (target != nullptr) {
-            OnDemuxPadAdded(d, pad, target);
-        }
-        if (caps != nullptr) {
-            gst_caps_unref(caps);
-        }
-    }), new GstElement*[2]{ vqueue, aqueue });
+    printf(
+        "MulticastPlayer: VBO source and "
+        "video/audio links successful\n");
 
-    // Watch the bus for state, error and EOS messages.
-    GstBus* bus = gst_element_get_bus(_pipeline);
-    _busWatchId = gst_bus_add_watch(bus, &GstMulticastPipeline::BusCallback, this);
+
+    /*
+     * -------------------------------------------------
+     * DYNAMIC TSDEMUX PADS
+     * -------------------------------------------------
+     */
+
+    g_signal_connect(
+        _demux,
+        "pad-added",
+        G_CALLBACK(
+            GstMulticastPipeline::OnDemuxPadAdded),
+        this);
+
+
+    /*
+     * -------------------------------------------------
+     * BUS
+     * -------------------------------------------------
+     */
+
+    GstBus* bus =
+        gst_element_get_bus(
+            _pipeline);
+
+    _busWatchId =
+        gst_bus_add_watch(
+            bus,
+            &GstMulticastPipeline::BusCallback,
+            this);
+
     gst_object_unref(bus);
 
+
     SetState(State::Opened);
+
+    printf(
+        "MulticastPlayer: VBO pipeline "
+        "opened successfully\n");
+
     return true;
 }
 
-bool GstMulticastPipeline::Play() {
+
+/*
+ * -----------------------------------------------------
+ * TUNE
+ * -----------------------------------------------------
+ *
+ * Change the VBO channel while the pipeline is alive.
+ *
+ * gstfeiptsrc already handles the actual FEIP
+ * reconnect when dst-ip/dst-port changes.
+ */
+bool GstMulticastPipeline::Tune(
+    const std::string& ip,
+    int port)
+{
     std::lock_guard<std::mutex> guard(_lock);
-    if (_pipeline == nullptr) {
-        if (_onError) {
-            _onError(kErrStateChange, "Play requested with no open pipeline");
-        }
+
+    if (_source == nullptr) {
+
+        printf(
+            "MulticastPlayer: Tune failed - "
+            "source is not available\n");
+
         return false;
     }
-    // READY -> PAUSED triggers auto-multicast IGMP join on udpsrc.
-    const GstStateChangeReturn ret = gst_element_set_state(_pipeline, GST_STATE_PLAYING);
+
+    if (ip.empty() ||
+        port <= 0 ||
+        port > 65535) {
+
+        printf(
+            "MulticastPlayer: invalid tune "
+            "parameters: %s:%d\n",
+            ip.c_str(),
+            port);
+
+        return false;
+    }
+
+
+    printf(
+        "==================================================\n");
+
+    printf(
+        "MulticastPlayer: RETUNE\n");
+
+    printf(
+        "Old stream : %s:%d\n",
+        _host.c_str(),
+        _port);
+
+    printf(
+        "New stream : %s:%d\n",
+        ip.c_str(),
+        port);
+
+    printf(
+        "==================================================\n");
+
+
+    /*
+     * Changing these properties invokes the
+     * existing gstfeiptsrc property setters.
+     *
+     * When the source is running, those setters
+     * perform the FEIP reconnect.
+     */
+
+    g_object_set(
+        G_OBJECT(_source),
+        "dst-ip",
+        ip.c_str(),
+        nullptr);
+
+
+    g_object_set(
+        G_OBJECT(_source),
+        "dst-port",
+        port,
+        nullptr);
+
+
+    _host = ip;
+    _port = port;
+
+
+    printf(
+        "MulticastPlayer: "
+        "FEIP retune requested\n");
+
+    return true;
+}
+
+
+/*
+ * -----------------------------------------------------
+ * PLAY
+ * -----------------------------------------------------
+ */
+bool GstMulticastPipeline::Play()
+{
+    std::lock_guard<std::mutex> guard(_lock);
+
+    if (_pipeline == nullptr) {
+
+        if (_onError) {
+
+            _onError(
+                kErrStateChange,
+                "Play requested with "
+                "no open pipeline");
+        }
+
+        return false;
+    }
+
+    printf(
+        "MulticastPlayer: "
+        "setting pipeline PLAYING\n");
+
+    const GstStateChangeReturn ret =
+        gst_element_set_state(
+            _pipeline,
+            GST_STATE_PLAYING);
+
     if (ret == GST_STATE_CHANGE_FAILURE) {
+
         if (_onError) {
-            _onError(kErrStateChange, "Failed to set pipeline to PLAYING");
+
+            _onError(
+                kErrStateChange,
+                "Failed to set pipeline "
+                "to PLAYING");
         }
+
         SetState(State::Error);
+
         return false;
     }
+
     SetState(State::Playing);
+
     return true;
 }
 
-bool GstMulticastPipeline::Stop() {
+
+/*
+ * -----------------------------------------------------
+ * STOP
+ * -----------------------------------------------------
+ */
+bool GstMulticastPipeline::Stop()
+{
     std::lock_guard<std::mutex> guard(_lock);
+
     if (_pipeline == nullptr) {
         return false;
     }
-    // PAUSED -> READY -> NULL triggers the IGMP leave on udpsrc.
-    gst_element_set_state(_pipeline, GST_STATE_NULL);
+
+    printf(
+        "MulticastPlayer: "
+        "stopping pipeline\n");
+
+    gst_element_set_state(
+        _pipeline,
+        GST_STATE_NULL);
+
     SetState(State::Stopped);
+
     return true;
 }
 
-void GstMulticastPipeline::Close() {
+
+/*
+ * -----------------------------------------------------
+ * CLOSE
+ * -----------------------------------------------------
+ */
+void GstMulticastPipeline::Close()
+{
     std::lock_guard<std::mutex> guard(_lock);
+
     Cleanup();
+
     SetState(State::Idle);
 }
 
-bool GstMulticastPipeline::SetVideoRectangle(int x, int y, int width, int height) {
+
+/*
+ * -----------------------------------------------------
+ * VIDEO RECTANGLE
+ * -----------------------------------------------------
+ */
+bool GstMulticastPipeline::SetVideoRectangle(
+    int x,
+    int y,
+    int width,
+    int height)
+{
     std::lock_guard<std::mutex> guard(_lock);
+
     _rectX = x;
     _rectY = y;
     _rectW = width;
     _rectH = height;
-    // Stored now; applied when the pipeline/sink is built, or immediately if the
-    // sink already exists and exposes a geometry property.
+
     return ApplyRectangleToSink();
 }
 
-GstMulticastPipeline::State GstMulticastPipeline::GetState() const {
+
+/*
+ * -----------------------------------------------------
+ * GET STATE
+ * -----------------------------------------------------
+ */
+GstMulticastPipeline::State
+GstMulticastPipeline::GetState() const
+{
     std::lock_guard<std::mutex> guard(_lock);
+
     return _state;
 }
 
-gboolean GstMulticastPipeline::BusCallback(GstBus* /*bus*/, GstMessage* message, gpointer user_data) {
-    auto* self = static_cast<GstMulticastPipeline*>(user_data);
+
+/*
+ * -----------------------------------------------------
+ * GST BUS CALLBACK
+ * -----------------------------------------------------
+ */
+gboolean GstMulticastPipeline::BusCallback(
+    GstBus* /*bus*/,
+    GstMessage* message,
+    gpointer user_data)
+{
+    auto* self =
+        static_cast<GstMulticastPipeline*>(
+            user_data);
+
+    if (self == nullptr ||
+        message == nullptr) {
+
+        return TRUE;
+    }
+
     switch (GST_MESSAGE_TYPE(message)) {
-    case GST_MESSAGE_ERROR: {
+
+    case GST_MESSAGE_ERROR:
+    {
         GError* err = nullptr;
         gchar* debug = nullptr;
-        gst_message_parse_error(message, &err, &debug);
-        if (self->_onError) {
-            self->_onError(kErrStream, err != nullptr ? err->message : "stream error");
+
+        gst_message_parse_error(
+            message,
+            &err,
+            &debug);
+
+        printf(
+            "MulticastPlayer "
+            "GStreamer ERROR:\n");
+
+        if (err != nullptr) {
+
+            printf(
+                "  Error : %s\n",
+                err->message);
         }
-        self->SetState(State::Error);
+
+        if (debug != nullptr) {
+
+            printf(
+                "  Debug : %s\n",
+                debug);
+        }
+
+        if (self->_onError) {
+
+            self->_onError(
+                kErrStream,
+                err != nullptr
+                    ? err->message
+                    : "stream error");
+        }
+
+        self->SetState(
+            State::Error);
+
         if (err != nullptr) {
             g_error_free(err);
         }
+
         g_free(debug);
+
         break;
     }
+
+
     case GST_MESSAGE_EOS:
+
+        printf(
+            "MulticastPlayer: EOS\n");
+
         if (self->_onEos) {
             self->_onEos();
         }
-        self->SetState(State::Stopped);
+
+        self->SetState(
+            State::Stopped);
+
         break;
+
+
     default:
         break;
     }
+
     return TRUE;
 }
 
-void GstMulticastPipeline::SetState(State state) {
+
+/*
+ * -----------------------------------------------------
+ * STATE
+ * -----------------------------------------------------
+ */
+void GstMulticastPipeline::SetState(
+    State state)
+{
     _state = state;
+
     if (_onStatus) {
         _onStatus(state);
     }
 }
 
-void GstMulticastPipeline::Cleanup() {
+
+/*
+ * -----------------------------------------------------
+ * CLEANUP
+ * -----------------------------------------------------
+ */
+void GstMulticastPipeline::Cleanup()
+{
+    printf(
+        "MulticastPlayer: Cleanup()\n");
+
     if (_busWatchId != 0) {
-        g_source_remove(_busWatchId);
+
+        g_source_remove(
+            _busWatchId);
+
         _busWatchId = 0;
     }
+
+
     if (_pipeline != nullptr) {
-        gst_element_set_state(_pipeline, GST_STATE_NULL);
-        gst_object_unref(_pipeline);
+
+        gst_element_set_state(
+            _pipeline,
+            GST_STATE_NULL);
+
+        gst_object_unref(
+            _pipeline);
+
         _pipeline = nullptr;
     }
-    _source = nullptr;
-    _videoSink = nullptr;
-    _rectProperty = nullptr;
+
+
+    /*
+     * These elements are owned by the pipeline.
+     * Do not unref them individually.
+     */
+
+    _source =
+        nullptr;
+
+    _tsParse =
+        nullptr;
+
+    _depay =
+        nullptr;
+
+    _demux =
+        nullptr;
+
+
+    _videoQueue =
+        nullptr;
+
+    _videoParse =
+        nullptr;
+
+    _videoDecoder =
+        nullptr;
+
+    _videoSink =
+        nullptr;
+
+
+    _audioQueue =
+        nullptr;
+
+    _audioParse =
+        nullptr;
+
+    _audioDecoder =
+        nullptr;
+
+    _audioConvert =
+        nullptr;
+
+    _audioResample =
+        nullptr;
+
+    _audioQueue2 =
+        nullptr;
+
+    _audioCaps =
+        nullptr;
+
+    _audioSink =
+        nullptr;
+
+
+    _rectProperty =
+        nullptr;
+
+
+    _chosenVideoDecoder.clear();
+
+    _chosenAudioDecoder.clear();
+
+    _chosenVideoSink.clear();
+
+
+    printf(
+        "MulticastPlayer: "
+        "Cleanup complete\n");
 }
 
 } // namespace Plugin

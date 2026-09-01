@@ -73,6 +73,9 @@ private:
     uint32_t endpoint_play(const JsonObject& parameters, JsonObject& response);
     uint32_t endpoint_stop(const JsonObject& parameters, JsonObject& response);
     uint32_t endpoint_close(const JsonObject& parameters, JsonObject& response);
+    uint32_t endpoint_tune(
+    const JsonObject& parameters,
+    JsonObject& response);
     uint32_t endpoint_setVideoRectangle(const JsonObject& parameters, JsonObject& response);
     uint32_t endpoint_status(const JsonObject& parameters, JsonObject& response);
 
